@@ -108,6 +108,15 @@
       { user: tx-sender, study-id: new-study-id }
       { is-owner: true }
     )
+    (let
+      (
+        (metrics (get-or-init-metrics tx-sender))
+      )
+      (map-set user-metrics
+        { user: tx-sender }
+        (merge metrics { studies-created: (+ (get studies-created metrics) u1) })
+      )
+    )
     (var-set study-counter new-study-id)
     (ok new-study-id)
   )
@@ -248,18 +257,25 @@
             { study-id: (get study-id replication-data) }
             (merge study-data { successful-replications: (+ (get successful-replications study-data) u1) })
           )
+          (update-research-metrics (get researcher study-data) true)
+          (update-replication-metrics (get replicator replication-data) true)
+          (update-review-metrics tx-sender true)
         )
         (if (and (not is-successful) (>= new-approvals-count MIN_COLLABORATOR_APPROVALS))
-          (map-set replications
-            { replication-id: replication-id }
-            (merge replication-data 
-              {
-                status: REPLICATION_STATUS_REJECTED,
-                verified-at: (some current-block),
-                reviewer: (some tx-sender),
-                approvals-count: new-approvals-count
-              }
+          (begin
+            (map-set replications
+              { replication-id: replication-id }
+              (merge replication-data 
+                {
+                  status: REPLICATION_STATUS_REJECTED,
+                  verified-at: (some current-block),
+                  reviewer: (some tx-sender),
+                  approvals-count: new-approvals-count
+                }
+              )
             )
+            (update-replication-metrics (get replicator replication-data) false)
+            (update-review-metrics tx-sender true)
           )
           true
         )
@@ -279,6 +295,7 @@
     )
     (asserts! (is-eq tx-sender (get researcher study-data)) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq (get status replication-data) REPLICATION_STATUS_PENDING) ERR_INVALID_STATUS)
+    (asserts! (>= (get-user-reputation tx-sender) MIN_REVIEWER_REPUTATION) ERR_INSUFFICIENT_REPUTATION)
     (if is-successful
       (begin
         (try! (as-contract (stx-transfer? bounty-per-replication tx-sender (get replicator replication-data))))
@@ -296,16 +313,23 @@
           { study-id: (get study-id replication-data) }
           (merge study-data { successful-replications: (+ (get successful-replications study-data) u1) })
         )
+        (update-research-metrics (get researcher study-data) true)
+        (update-replication-metrics (get replicator replication-data) true)
+        (update-review-metrics tx-sender true)
       )
-      (map-set replications
-        { replication-id: replication-id }
-        (merge replication-data 
-          {
-            status: REPLICATION_STATUS_REJECTED,
-            verified-at: (some current-block),
-            reviewer: (some tx-sender)
-          }
+      (begin
+        (map-set replications
+          { replication-id: replication-id }
+          (merge replication-data 
+            {
+              status: REPLICATION_STATUS_REJECTED,
+              verified-at: (some current-block),
+              reviewer: (some tx-sender)
+            }
+          )
         )
+        (update-replication-metrics (get replicator replication-data) false)
+        (update-review-metrics tx-sender true)
       )
     )
     (ok is-successful)
@@ -423,5 +447,164 @@
         status: (get status replication-data)
       })
     none
+  )
+)
+
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u450))
+
+(define-constant REPUTATION_SCALE u1000)
+(define-constant RESEARCH_WEIGHT u400)
+(define-constant REPLICATION_WEIGHT u350)
+(define-constant REVIEW_WEIGHT u250)
+(define-constant MIN_REVIEWER_REPUTATION u100)
+
+(define-constant TIER_BRONZE u200)
+(define-constant TIER_SILVER u500)
+(define-constant TIER_GOLD u800)
+(define-constant TIER_PLATINUM u1000)
+
+(define-map user-metrics
+  { user: principal }
+  {
+    studies-created: uint,
+    studies-successful: uint,
+    replications-submitted: uint,
+    replications-verified: uint,
+    reviews-made: uint,
+    reviews-accurate: uint
+  }
+)
+
+(define-private (safe-divide (numerator uint) (denominator uint) (scale uint))
+  (if (is-eq denominator u0)
+    u0
+    (/ (* numerator scale) denominator)
+  )
+)
+
+(define-private (calculate-score (successful uint) (total uint) (weight uint))
+  (* (safe-divide successful total REPUTATION_SCALE) weight)
+)
+
+(define-private (get-or-init-metrics (user principal))
+  (default-to 
+    {
+      studies-created: u0,
+      studies-successful: u0,
+      replications-submitted: u0,
+      replications-verified: u0,
+      reviews-made: u0,
+      reviews-accurate: u0
+    }
+    (map-get? user-metrics { user: user })
+  )
+)
+
+(define-private (update-research-metrics (researcher principal) (is-successful bool))
+  (let
+    (
+      (metrics (get-or-init-metrics researcher))
+      (new-successful (if is-successful (+ (get studies-successful metrics) u1) (get studies-successful metrics)))
+    )
+    (map-set user-metrics
+      { user: researcher }
+      (merge metrics { studies-successful: new-successful })
+    )
+  )
+)
+
+(define-private (update-replication-metrics (replicator principal) (is-verified bool))
+  (let
+    (
+      (metrics (get-or-init-metrics replicator))
+      (new-submitted (+ (get replications-submitted metrics) u1))
+      (new-verified (if is-verified (+ (get replications-verified metrics) u1) (get replications-verified metrics)))
+    )
+    (map-set user-metrics
+      { user: replicator }
+      (merge metrics 
+        {
+          replications-submitted: new-submitted,
+          replications-verified: new-verified
+        }
+      )
+    )
+  )
+)
+
+(define-private (update-review-metrics (reviewer principal) (is-accurate bool))
+  (let
+    (
+      (metrics (get-or-init-metrics reviewer))
+      (new-made (+ (get reviews-made metrics) u1))
+      (new-accurate (if is-accurate (+ (get reviews-accurate metrics) u1) (get reviews-accurate metrics)))
+    )
+    (map-set user-metrics
+      { user: reviewer }
+      (merge metrics 
+        {
+          reviews-made: new-made,
+          reviews-accurate: new-accurate
+        }
+      )
+    )
+  )
+)
+
+(define-read-only (get-user-metrics (user principal))
+  (get-or-init-metrics user)
+)
+
+(define-read-only (get-user-scores (user principal))
+  (let
+    (
+      (metrics (get-or-init-metrics user))
+      (research-score (calculate-score (get studies-successful metrics) (get studies-created metrics) RESEARCH_WEIGHT))
+      (replication-score (calculate-score (get replications-verified metrics) (get replications-submitted metrics) REPLICATION_WEIGHT))
+      (review-score (calculate-score (get reviews-accurate metrics) (get reviews-made metrics) REVIEW_WEIGHT))
+    )
+    {
+      research-score: research-score,
+      replication-score: replication-score,
+      review-score: review-score
+    }
+  )
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (let
+    (
+      (scores (get-user-scores user))
+      (total-score (+ (+ (get research-score scores) (get replication-score scores)) (get review-score scores)))
+    )
+    (/ total-score REPUTATION_SCALE)
+  )
+)
+
+(define-read-only (get-user-tier (user principal))
+  (let
+    (
+      (reputation (get-user-reputation user))
+    )
+    (if (>= reputation TIER_PLATINUM)
+      { tier-id: u4, tier-name: "Platinum" }
+      (if (>= reputation TIER_GOLD)
+        { tier-id: u3, tier-name: "Gold" }
+        (if (>= reputation TIER_SILVER)
+          { tier-id: u2, tier-name: "Silver" }
+          { tier-id: u1, tier-name: "Bronze" }
+        )
+      )
+    )
+  )
+)
+
+(define-public (initialize-user-metrics)
+  (let
+    (
+      (metrics (get-or-init-metrics tx-sender))
+    )
+    (map-set user-metrics { user: tx-sender } metrics)
+    (ok true)
   )
 )
