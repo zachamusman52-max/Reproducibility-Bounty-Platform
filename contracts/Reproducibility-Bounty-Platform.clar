@@ -1,4 +1,4 @@
-(define-constant CONTRACT_OWNER tx-sender)
+﻿(define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u401))
 (define-constant ERR_STUDY_NOT_FOUND (err u404))
 (define-constant ERR_INSUFFICIENT_BOUNTY (err u400))
@@ -24,6 +24,7 @@
 
 (define-data-var study-counter uint u0)
 (define-data-var replication-counter uint u0)
+(define-data-var dispute-counter uint u0)
 
 (define-map studies
   { study-id: uint }
@@ -79,6 +80,32 @@
 (define-map replication-approvals
   { replication-id: uint, approver: principal }
   { approved-at: uint, is-successful: bool }
+)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    replication-id: uint,
+    disputer: principal,
+    reason: (string-ascii 512),
+    stake-amount: uint,
+    created-at: uint,
+    deadline: uint,
+    status: uint,
+    votes-for: uint,
+    votes-against: uint,
+    total-voters: uint
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, voter: principal }
+  { vote: bool, stake: uint, voted-at: uint }
+)
+
+(define-map replication-disputes
+  { replication-id: uint }
+  { dispute-id: uint }
 )
 
 (define-public (create-study (title (string-ascii 256)) (description (string-ascii 1024)) (methodology (string-ascii 2048)) (bounty-amount uint))
@@ -372,6 +399,134 @@
   )
 )
 
+(define-public (create-dispute (replication-id uint) (reason (string-ascii 512)) (stake-amount uint))
+  (let
+    (
+      (replication-data (unwrap! (map-get? replications { replication-id: replication-id }) ERR_REPLICATION_NOT_FOUND))
+      (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (new-dispute-id (+ (var-get dispute-counter) u1))
+      (deadline (+ current-block DISPUTE_VOTING_PERIOD))
+    )
+    (asserts! (is-eq tx-sender (get replicator replication-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status replication-data) REPLICATION_STATUS_REJECTED) ERR_INVALID_STATUS)
+    (asserts! (is-none (map-get? replication-disputes { replication-id: replication-id })) ERR_DISPUTE_ALREADY_EXISTS)
+    (asserts! (>= stake-amount MIN_DISPUTE_STAKE) ERR_INSUFFICIENT_STAKE)
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    (map-set disputes
+      { dispute-id: new-dispute-id }
+      {
+        replication-id: replication-id,
+        disputer: tx-sender,
+        reason: reason,
+        stake-amount: stake-amount,
+        created-at: current-block,
+        deadline: deadline,
+        status: DISPUTE_STATUS_OPEN,
+        votes-for: u0,
+        votes-against: u0,
+        total-voters: u0
+      }
+    )
+    (map-set replication-disputes
+      { replication-id: replication-id }
+      { dispute-id: new-dispute-id }
+    )
+    (var-set dispute-counter new-dispute-id)
+    (ok new-dispute-id)
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for bool) (stake-amount uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (voter-reputation (get-user-reputation tx-sender))
+    )
+    (asserts! (is-eq (get status dispute-data) DISPUTE_STATUS_OPEN) ERR_DISPUTE_CLOSED)
+    (asserts! (< current-block (get deadline dispute-data)) ERR_DISPUTE_TIMEOUT_NOT_REACHED)
+    (asserts! (is-none (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender })) ERR_ALREADY_VOTED)
+    (asserts! (>= voter-reputation MIN_REVIEWER_REPUTATION) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (>= stake-amount MIN_DISPUTE_STAKE) ERR_INSUFFICIENT_STAKE)
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    (map-set dispute-votes
+      { dispute-id: dispute-id, voter: tx-sender }
+      { vote: vote-for, stake: stake-amount, voted-at: current-block }
+    )
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data
+        {
+          votes-for: (if vote-for (+ (get votes-for dispute-data) u1) (get votes-for dispute-data)),
+          votes-against: (if vote-for (get votes-against dispute-data) (+ (get votes-against dispute-data) u1)),
+          total-voters: (+ (get total-voters dispute-data) u1)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (replication-data (unwrap! (map-get? replications { replication-id: (get replication-id dispute-data) }) ERR_REPLICATION_NOT_FOUND))
+      (study-data (unwrap! (map-get? studies { study-id: (get study-id replication-data) }) ERR_STUDY_NOT_FOUND))
+      (current-block (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (is-upheld (> (get votes-for dispute-data) (get votes-against dispute-data)))
+      (has-min-votes (>= (get total-voters dispute-data) MIN_DISPUTE_VOTES))
+      (bounty-per-replication (/ (get bounty-amount study-data) u10))
+    )
+    (asserts! (is-eq (get status dispute-data) DISPUTE_STATUS_OPEN) ERR_DISPUTE_CLOSED)
+    (asserts! (>= current-block (get deadline dispute-data)) ERR_DISPUTE_TIMEOUT_NOT_REACHED)
+    (asserts! has-min-votes ERR_INSUFFICIENT_REPUTATION)
+    (if is-upheld
+      (begin
+        (try! (as-contract (stx-transfer? bounty-per-replication tx-sender (get replicator replication-data))))
+        (try! (as-contract (stx-transfer? (get stake-amount dispute-data) tx-sender (get disputer dispute-data))))
+        (map-set replications
+          { replication-id: (get replication-id dispute-data) }
+          (merge replication-data { status: REPLICATION_STATUS_VERIFIED })
+        )
+        (map-set studies
+          { study-id: (get study-id replication-data) }
+          (merge study-data { successful-replications: (+ (get successful-replications study-data) u1) })
+        )
+        (map-set disputes
+          { dispute-id: dispute-id }
+          (merge dispute-data { status: DISPUTE_STATUS_RESOLVED_UPHELD })
+        )
+      )
+      (begin
+        (map-set disputes
+          { dispute-id: dispute-id }
+          (merge dispute-data { status: DISPUTE_STATUS_RESOLVED_REJECTED })
+        )
+      )
+    )
+    (ok is-upheld)
+  )
+)
+
+(define-public (claim-dispute-reward (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (vote-data (unwrap! (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender }) ERR_ALREADY_VOTED))
+      (is-resolved (or (is-eq (get status dispute-data) DISPUTE_STATUS_RESOLVED_UPHELD) (is-eq (get status dispute-data) DISPUTE_STATUS_RESOLVED_REJECTED)))
+      (is-winner (is-eq (get vote vote-data) (is-eq (get status dispute-data) DISPUTE_STATUS_RESOLVED_UPHELD)))
+      (total-stake (get stake-amount dispute-data))
+      (voter-stake (get stake vote-data))
+      (reward-amount (if is-winner (+ voter-stake (/ total-stake (get total-voters dispute-data))) voter-stake))
+    )
+    (asserts! is-resolved ERR_DISPUTE_NOT_RESOLVED)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+    (map-delete dispute-votes { dispute-id: dispute-id, voter: tx-sender })
+    (ok reward-amount)
+  )
+)
+
 (define-read-only (get-study (study-id uint))
   (map-get? studies { study-id: study-id })
 )
@@ -450,7 +605,44 @@
   )
 )
 
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-for-replication (replication-id uint))
+  (match (map-get? replication-disputes { replication-id: replication-id })
+    dispute-mapping (map-get? disputes { dispute-id: (get dispute-id dispute-mapping) })
+    none
+  )
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, voter: voter })
+)
+
+(define-read-only (get-dispute-status (dispute-id uint))
+  (match (map-get? disputes { dispute-id: dispute-id })
+    dispute-data
+      (some {
+        status: (get status dispute-data),
+        votes-for: (get votes-for dispute-data),
+        votes-against: (get votes-against dispute-data),
+        total-voters: (get total-voters dispute-data),
+        is-open: (is-eq (get status dispute-data) DISPUTE_STATUS_OPEN),
+        deadline: (get deadline dispute-data)
+      })
+    none
+  )
+)
+
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u450))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u451))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u452))
+(define-constant ERR_DISPUTE_CLOSED (err u453))
+(define-constant ERR_ALREADY_VOTED (err u454))
+(define-constant ERR_INSUFFICIENT_STAKE (err u455))
+(define-constant ERR_DISPUTE_NOT_RESOLVED (err u456))
+(define-constant ERR_DISPUTE_TIMEOUT_NOT_REACHED (err u457))
 
 (define-constant REPUTATION_SCALE u1000)
 (define-constant RESEARCH_WEIGHT u400)
@@ -462,6 +654,13 @@
 (define-constant TIER_SILVER u500)
 (define-constant TIER_GOLD u800)
 (define-constant TIER_PLATINUM u1000)
+
+(define-constant DISPUTE_STATUS_OPEN u1)
+(define-constant DISPUTE_STATUS_RESOLVED_UPHELD u2)
+(define-constant DISPUTE_STATUS_RESOLVED_REJECTED u3)
+(define-constant MIN_DISPUTE_STAKE u1000000)
+(define-constant DISPUTE_VOTING_PERIOD u144)
+(define-constant MIN_DISPUTE_VOTES u3)
 
 (define-map user-metrics
   { user: principal }
